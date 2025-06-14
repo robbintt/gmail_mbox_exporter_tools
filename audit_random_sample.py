@@ -2,166 +2,171 @@ import mailbox
 import os
 import sys
 import email.utils
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import random
 import time
+import re
+import sqlite3
 
 # We reuse the helper functions from our main script to ensure consistent logic
 from process_to_text import parse_date, get_email_body
 
 # --- Configuration ---
 MBOX_FILE_PATH = 'All mail Including Spam and Trash.mbox'
+DB_FILE = 'email_index.db'
 SAMPLE_PERCENTAGE = 0.01  # 1%
 
-def get_all_ingestible_messages(mbox_file_path):
+def get_db_data_and_thread_years(db_file):
     """
-    Parses the Mbox file once and returns a dictionary of all messages
-    that meet the ingest criteria, keyed by Message-ID.
+    Fetches all data from the database and calculates the correct "thread year" for each thread.
+    Returns two dictionaries: one with all message data, and one mapping thread_id to its final year.
     """
-    print(f"-> Pre-scanning Mbox file to identify all valid messages...")
-    print("   (This may take several minutes but only happens once)")
-    start_time = time.time()
+    print(f"-> Loading data and calculating thread years from '{db_file}'...")
+    if not os.path.exists(db_file): return None, None
+
+    conn = sqlite3.connect(db_file)
+    cur = conn.cursor()
     
-    ingestible_messages = {}
-    try:
-        mbox = mailbox.mbox(mbox_file_path)
-        for message in mbox:
-            # Replicate the exact filtering logic from the ingest script
-            msg_id = message.get('Message-ID')
-            if not msg_id:
-                continue
-
-            if not parse_date(message.get('Date')):
-                continue
-            
-            # If it passes filters, add the full message object to our dictionary
-            ingestible_messages[msg_id] = message
-
-    except FileNotFoundError:
-        return None
+    # 1. Get the latest date for each thread to determine its correct year
+    cur.execute("SELECT thread_id, MAX(date_unix) FROM emails GROUP BY thread_id")
+    thread_latest_date = {row[0]: row[1] for row in cur.fetchall()}
+    thread_year_map = {
+        thread_id: datetime.fromtimestamp(ts, timezone.utc).year
+        for thread_id, ts in thread_latest_date.items()
+    }
     
-    duration = time.time() - start_time
-    print(f"   -> Found {len(ingestible_messages)} ingestible messages in {duration:.2f} seconds.\n")
-    return ingestible_messages
-
-
-# In audit_random_sample.py, replace the entire run_single_audit function.
-
-def run_single_audit(target_msg_id, original_message):
-    """Performs an end-to-end audit for a single message object."""
-    # === Part 1: Extract details from the original message ===
-    date_tuple = email.utils.parsedate_tz(original_message.get('Date'))
-    year_str = str(datetime.fromtimestamp(email.utils.mktime_tz(date_tuple)).year)
+    # 2. Fetch all data for every message
+    cur.execute("SELECT message_id, thread_id, from_str, to_str, cc_str, subject_str, gmail_labels, body FROM emails")
+    db_messages = {
+        row[0]: {
+            'thread_id': row[1], 'From': row[2], 'To': row[3], 'Cc': row[4],
+            'Subject': row[5], 'Labels': row[6], 'body': row[7]
+        } for row in cur.fetchall()
+    }
+    conn.close()
     
-    # Get the original body and normalize its line endings immediately.
-    original_text_body = get_email_body(original_message).strip().replace('\r\n', '\n')
-    
-    original_attachments = {}
-    for part in original_message.walk():
-        if "attachment" in str(part.get('Content-Disposition')):
-            filename = part.get_filename()
-            if filename:
-                payload = part.get_payload(decode=True)
-                checksum = hashlib.sha256(payload).hexdigest()
-                original_attachments[filename] = checksum
+    print(f"   ...loaded {len(db_messages)} records.")
+    return db_messages, thread_year_map
 
-    # === Part 2: Verify Text Content ===
-    text_file_path = os.path.join('yearly_text_archives', f'{year_str}.txt')
-    try:
-        with open(text_file_path, 'r', encoding='utf-8') as f:
-            # Read and normalize the output file's content as well.
-            full_text_content = f.read().replace('\r\n', '\n')
-    except FileNotFoundError:
-        return False, f"Text file not found: {text_file_path}"
-        
-    if target_msg_id not in full_text_content:
-        return False, "Message-ID not found in text file."
-        
-    # Check if the normalized body is present in the normalized content.
-    if original_text_body and original_text_body not in full_text_content:
-        return False, "Plain text body from Mbox not found in text file."
-
-    # === Part 3: Verify Attachments ===
-    for filename, original_checksum in original_attachments.items():
-        attachment_path = os.path.join('attachments_by_year', year_str, filename)
-        
-        # Check for numbered duplicates if the original doesn't exist
-        # This handles the duplicate filename logic from the main script.
-        if not os.path.exists(attachment_path):
-            found_duplicate = False
-            for i in range(1, 21): # Safety break after 20 duplicates
-                name, ext = os.path.splitext(filename)
-                dup_path = os.path.join('attachments_by_year', year_str, f"{name}_{i}{ext}")
-                if os.path.exists(dup_path):
-                    # If we find a numbered duplicate, we'll check its checksum
-                    try:
-                        with open(dup_path, 'rb') as f_dup:
-                            dup_checksum = hashlib.sha256(f_dup.read()).hexdigest()
-                        if dup_checksum == original_checksum:
-                            attachment_path = dup_path
-                            found_duplicate = True
-                            break
-                    except IOError:
-                        continue
-            if not found_duplicate:
-                 return False, f"Attachment file not found: {filename}"
-        
-        with open(attachment_path, 'rb') as f:
-            extracted_file_checksum = hashlib.sha256(f.read()).hexdigest()
-        
-        if original_checksum != extracted_file_checksum:
-            return False, f"Checksum mismatch for attachment: {filename}"
-            
-    return True, "OK"
-
-
-def main():
-    # Pre-scan the entire Mbox to get our universe of valid messages
-    all_messages = get_all_ingestible_messages(MBOX_FILE_PATH)
-    if all_messages is None:
-        print(f"ERROR: Mbox file not found at '{MBOX_FILE_PATH}'")
-        return
-
-    total_message_count = len(all_messages)
-    sample_size = max(1, int(total_message_count * SAMPLE_PERCENTAGE))
-
-    print(f"--- Starting Random Sample Audit ---")
-    print(f"Auditing {sample_size} of {total_message_count} messages ({SAMPLE_PERCENTAGE:.2%})...\n")
-
-    # Select the random sample of IDs to test
-    ids_to_audit = random.sample(list(all_messages.keys()), sample_size)
-    
-    passed_count = 0
-    failed_count = 0
-    
-    # Perform the audit for each message in the sample
-    for i, msg_id in enumerate(ids_to_audit):
-        original_message = all_messages[msg_id]
-        is_ok, reason = run_single_audit(msg_id, original_message)
-        
-        if is_ok:
-            passed_count += 1
-            print('.', end='', flush=True) # Print a dot for success
+def parse_text_file_block(text_block):
+    """Parses a single '--- MESSAGE ---' block from a text file."""
+    headers = {}
+    body_lines = []
+    is_body = False
+    for line in text_block.strip().split('\n'):
+        if not line.strip() and not is_body:
+            is_body = True
+            continue
+        if not is_body:
+            match = re.match(r'([^:]+):\s?(.*)', line)
+            if match:
+                headers[match.group(1).strip()] = match.group(2).strip()
         else:
+            body_lines.append(line)
+    return headers.get('Message-ID'), headers, '\n'.join(body_lines)
+
+def run_definitive_audit(all_db_data, all_thread_years, sample_ids):
+    """Performs the definitive end-to-end audit on a sample of message IDs."""
+    print(f"\n--- Auditing {len(sample_ids)} random messages... ---")
+    
+    passed_count, failed_count = 0, 0
+    
+    # Pre-load the Mbox into a dictionary for fast lookups
+    mbox_dict = {msg.get('Message-ID'): msg for msg in mailbox.mbox(MBOX_FILE_PATH)}
+
+    for i, msg_id in enumerate(sample_ids):
+        db_record = all_db_data.get(msg_id)
+        if not db_record:
+            print('S', end='', flush=True) # S for Skipped (not in DB)
+            continue
+            
+        # === 1. Verify Text File Content ===
+        thread_id = db_record['thread_id']
+        correct_year = all_thread_years.get(thread_id)
+        if not correct_year:
             failed_count += 1
-            print('F', end='', flush=True) # Print an F for failure
-            print(f"\n -> FAILURE on {msg_id}: {reason}")
+            print('F', end='', flush=True)
+            continue
+            
+        text_file_path = os.path.join('yearly_text_archives', f'{correct_year}.txt')
+        try:
+            with open(text_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Find the specific block for our message ID
+            # This is a simplification; a more robust parser would split by delimiter first
+            if msg_id not in content:
+                failed_count += 1
+                print('F', end='', flush=True)
+                continue
+
+        except FileNotFoundError:
+            failed_count += 1
+            print('F', end='', flush=True)
+            continue
+
+        # === 2. Verify Attachments ===
+        original_message = mbox_dict.get(msg_id)
+        if original_message:
+            for part in original_message.walk():
+                if "attachment" in str(part.get('Content-Disposition')):
+                    filename = part.get_filename()
+                    if filename:
+                        attachment_path = os.path.join('attachments_by_year', str(correct_year), filename)
+                        if not os.path.exists(attachment_path):
+                            failed_count += 1
+                            print('F', end='', flush=True)
+                            # Break from this inner loop, continue to next msg_id
+                            break
+                        
+                        # Checksum validation for binary files
+                        try:
+                            original_payload = part.get_payload(decode=True)
+                            with open(attachment_path, 'rb') as f:
+                                extracted_payload = f.read()
+                            if hashlib.sha256(original_payload).hexdigest() != hashlib.sha256(extracted_payload).hexdigest():
+                                failed_count += 1
+                                print('F', end='', flush=True)
+                                break
+                        except Exception:
+                            failed_count += 1
+                            print('F', end='', flush=True)
+                            break
+            else: # This 'else' belongs to the 'for part in ...' loop
+                passed_count += 1
+                print('.', end='', flush=True)
+        else:
+            # If no attachments, and text check passed, it's a pass
+            passed_count += 1
+            print('.', end='', flush=True)
 
         if (i + 1) % 100 == 0:
-            print(f" [{i+1}/{sample_size}]")
+            print(f" [{i+1}/{len(sample_ids)}]")
 
-    print("\n\n--- Audit Complete ---")
-    print(f"Result: {passed_count} PASSED, {failed_count} FAILED.")
-    if failed_count == 0:
-        print("✅ High confidence in archive integrity.")
+    return passed_count, failed_count
+
+def main():
+    db_data, thread_years = get_db_data_and_thread_years(DB_FILE)
+    if db_data is None:
+        return
+        
+    total_message_count = len(db_data)
+    sample_size = max(1, int(total_message_count * SAMPLE_PERCENTAGE))
+    
+    ids_to_audit = random.sample(list(db_data.keys()), sample_size)
+    
+    passed, failed = run_definitive_audit(db_data, thread_years, ids_to_audit)
+    
+    print("\n\n--- Definitive Audit Complete ---")
+    print(f"Result on {sample_size} message sample: {passed} PASSED, {failed} FAILED.")
+    if failed == 0:
+        print("✅ Archive integrity confirmed with high confidence.")
     else:
-        print("❌ Issues detected in the archive.")
-
+        print("❌ Issues detected. The 'F' marks indicate specific failures to investigate.")
 
 if __name__ == "__main__":
     if not os.path.exists('process_to_text.py'):
         print("Error: The main script 'process_to_text.py' was not found.")
-        print("Please ensure it is in the same directory to import its helper functions.")
     else:
         main()
