@@ -1,0 +1,13 @@
+
+
+email_index.db
+*.mbox
+
+attachments_by_year/
+
+yearly_text_archives/
+old/
+
+__pycache__/
+
+User\ Settings/
