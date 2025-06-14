@@ -1,13 +1,13 @@
-
-
 email_index.db
 *.mbox
+.DS_Store
 
 attachments_by_year/
-
 yearly_text_archives/
-old/
+data/
 
 __pycache__/
 
 User\ Settings/
+
+old/
